@@ -1,0 +1,7 @@
+python-telegram-bot==21.1.1
+mistralai>=1.9.0
+python-dotenv
+pandas
+requests
+pypdf
+httpx>=0.28.1,<0.29.0
