@@ -10,7 +10,7 @@ from pypdf import PdfReader, PdfWriter
 from mistralai import Mistral
 
 from config import FREE_API_KEY, make_llm_io_path
-from llm_logging import log_llm_call
+from logging_setup import log_llm_call
 from logging_setup import FileStats
 
 

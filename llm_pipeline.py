@@ -14,7 +14,7 @@ import pandas as pd
 from logging import Logger
 
 from config import FREE_API_KEY, PAID_API_KEY, make_llm_io_path
-from llm_logging import log_llm_call
+from logging_setup import log_llm_call
 from logging_setup import FileStats
 
 # Константы/фразы границ
@@ -43,7 +43,7 @@ SYSTEM_PROMPT_STAGE2 = """
 — Кандидат нормализуй: убери пробелы и переводы строк, все тире замени на «-», латиницу сделай строчной.
 — Допустимые OCR-подстановки: O↔0, I↔1, l↔1, S↔5, Z↔2, B↔8.
 — В первых 5 группах разрешены только [0-9a-f], кириллица запрещена.
-— Формат обязателен: 8-4-4-4-12-1 (пример: c456294b-dcd0-11ед-81b3-efa2ccd7b24f-7).
+— Формат обязателен: 8-4-4-4-12-1 (пример: c456294b-dcd0-11aa-81b3-efa2ccd7b24f-7).
 — Можно восстановить только пропущенные дефисы по схеме 8-4-4-4-12-1, символы не придумывай.
 — Если валидного идентификатора нет — пиши «Не найдено».
 
