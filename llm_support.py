@@ -210,65 +210,55 @@ def extract_urgent_debt(text: str) -> str:
         return "Срочная задолженность: Н/Д"
 
     date_re = re.compile(r"\b(\d{2}[.-]\d{2}[.-]\d{4})\b")
+    date_full_re = re.compile(r"^\d{2}[.-]\d{2}[.-]\d{4}$")
     lines_with_dates = []
 
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        m = date_re.search(line)
-        if not m:
+
+        # Рассматриваем кандидатов ТОЛЬКО среди "правильных" табличных строк задолженности.
+        if "|" not in line:
             continue
-        date_str = m.group(1)
+        cols = [p.strip() for p in line.split("|") if p.strip()]
+        if not cols:
+            continue
+        if not date_full_re.fullmatch(cols[0]):
+            continue
+
+        date_str = cols[0]
         try:
             dt = datetime.strptime(date_str.replace(".", "-"), "%d-%m-%Y")
         except ValueError:
             continue
-        lines_with_dates.append((dt, date_str, line, m))
+
+        lines_with_dates.append((dt, date_str, line, cols))
 
     if not lines_with_dates:
         return "Срочная задолженность: Н/Д"
 
-    latest_dt, latest_date_str, latest_line, latest_match = max(
+    latest_dt, latest_date_str, latest_line, latest_cols = max(
         lines_with_dates, key=lambda t: t[0]
     )
 
     value: Optional[str] = None
 
-    # 1) Попытка извлечения по третьей колонке (таблица с разделителем '|')
-    if "|" in latest_line:
-        parts = [p.strip() for p in latest_line.split("|")]
-        cols = [p for p in parts if p]
-        if cols:
-            date_idx: Optional[int] = None
-            for i, col in enumerate(cols):
-                if latest_date_str in col:
-                    date_idx = i
-                    break
-            if date_idx is None:
-                for i, col in enumerate(cols):
-                    if date_re.search(col):
-                        date_idx = i
-                        break
-            if date_idx is not None:
-                target_idx = date_idx + 2
-                if target_idx < len(cols):
-                    target_col = cols[target_idx].strip()
-                    upper = target_col.upper().replace(" ", "")
-                    if upper not in {"Н/Д", "H/Д"} and target_col:
-                        m_num = re.search(r"\d[\d ]*(?:[.,]\d{2})?", target_col)
-                        if m_num:
-                            value = m_num.group(0).strip()
+    # 1) Попытка извлечения по третьей колонке (3-й столбец = cols[2])
+    if len(latest_cols) >= 3:
+        target_col = latest_cols[2].strip()
+        upper = target_col.upper().replace(" ", "")
+        if upper not in {"Н/Д", "H/Д"} and target_col:
+            m_num = re.search(r"\d[\d ]*(?:[.,]\d{2})?", target_col)
+            if m_num:
+                value = m_num.group(0).strip()
 
-    # 2) Fallback: по списку чисел в строке после даты
+    # 2) Fallback: по списку чисел в "хвостовых" колонках (только в выбранной правильной строке)
     if value is None:
-        rest = latest_line[latest_match.end() :]
-        numbers = re.findall(r"\d[\d ]*(?:[.,]\d{2})?", rest)
+        text_for_numbers = " | ".join(latest_cols[2:]) if len(latest_cols) >= 3 else ""
+        numbers = re.findall(r"\d[\d ]*(?:[.,]\d{2})?", text_for_numbers)
         if numbers:
-            if len(numbers) >= 2:
-                value = numbers[1].strip()
-            else:
-                value = numbers[0].strip()
+            value = numbers[0].strip()
 
     if value:
         return f"Срочная задолженность: {value}"
@@ -760,3 +750,4 @@ class MistralChatClient:
             },
         )
         return ""
+
