@@ -44,6 +44,18 @@ from llm_support import (
 
 # ---------- основной LLM-пайплайн ----------
 
+SMALL_TASKS_FULL_PARALLEL = 12
+MAX_LLM_PARALLEL_WORKERS = 10
+
+
+def _calc_max_workers(task_count: int) -> int:
+    if task_count <= 0:
+        return 1
+    if task_count <= SMALL_TASKS_FULL_PARALLEL:
+        return task_count
+    return MAX_LLM_PARALLEL_WORKERS
+
+
 def run_llm_pipeline(
     chunks_csv_path: Path,
     original_pdf_name: str,
@@ -186,7 +198,7 @@ def run_llm_pipeline(
     idxs_stage2: List[int] = list(chunks_df.index)
     if idxs_stage2:
         futures_map = {}
-        with ThreadPoolExecutor(max_workers=len(idxs_stage2)) as ex:
+        with ThreadPoolExecutor(max_workers=_calc_max_workers(len(idxs_stage2))) as ex:
             for idx in idxs_stage2:
                 number = main_df.at[idx, "Номер"]
                 title = main_df.at[idx, "Заголовок блока"]
@@ -297,7 +309,7 @@ def run_llm_pipeline(
         futures_map_inn = {}
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        with ThreadPoolExecutor(max_workers=len(idxs_inn_llm)) as ex:
+        with ThreadPoolExecutor(max_workers=_calc_max_workers(len(idxs_inn_llm))) as ex:
             for idx in idxs_inn_llm:
                 number = main_df.at[idx, "Номер"]
                 title = main_df.at[idx, "Заголовок блока"]
@@ -424,7 +436,7 @@ def run_llm_pipeline(
         futures_map_stage4: Dict[object, int] = {}
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        with ThreadPoolExecutor(max_workers=len(fallback_idxs)) as ex:
+        with ThreadPoolExecutor(max_workers=_calc_max_workers(len(fallback_idxs))) as ex:
             for idx in fallback_idxs:
                 number = main_df.at[idx, "Номер"]
                 title = main_df.at[idx, "Заголовок блока"]
@@ -540,7 +552,7 @@ def run_llm_pipeline(
 
     if idxs_stage5:
         futures_map = {}
-        with ThreadPoolExecutor(max_workers=len(idxs_stage5)) as ex:
+        with ThreadPoolExecutor(max_workers=_calc_max_workers(len(idxs_stage5))) as ex:
             for idx in idxs_stage5:
                 number = main_df.at[idx, "Номер"]
                 title = main_df.at[idx, "Заголовок блока"]
@@ -630,3 +642,4 @@ def run_llm_pipeline(
     )
 
     return result_csv_path
+
