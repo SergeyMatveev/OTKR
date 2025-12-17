@@ -196,72 +196,146 @@ def is_valid_debt_value(val: str) -> bool:
     return re.fullmatch(r"\d+(?:[.,]\d{2})?", v_compact) is not None
 
 
+def _normalize_urgent_debt_table_rows(text: str) -> str:
+    """
+    Нормализует таблицу для extract_urgent_debt():
+    склеивает перенос строки внутри одной логической строки Markdown-таблицы, когда:
+      - текущая строка начинается с '|' и содержит дату dd-mm-yyyy / dd.mm.yyyy,
+      - в текущей строке нет ни одного денежного значения вида ...,\d{2},
+      - следующая строка НЕ содержит дату, но содержит '|' и денежные значения.
+    """
+    if not text:
+        return text
+
+    date_any_re = re.compile(r"\b\d{2}[.-]\d{2}[.-]\d{4}\b")
+    money_any_re = re.compile(r"\b\d[\d \u00A0\u202F]*,\d{2}\b")
+
+    lines = text.splitlines()
+    out_lines: List[str] = []
+
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if (ln or "").lstrip().startswith("|") and date_any_re.search(ln or ""):
+            if money_any_re.search(ln or "") is None and i + 1 < len(lines):
+                nxt = lines[i + 1]
+                if (
+                    date_any_re.search(nxt or "") is None
+                    and "|" in (nxt or "")
+                    and money_any_re.search(nxt or "") is not None
+                ):
+                    left = (ln or "").rstrip()
+                    right = (nxt or "").strip()
+
+                    right2 = right.lstrip()
+                    if right2.startswith("|"):
+                        right2 = right2.lstrip("|").lstrip()
+
+                    if not left.rstrip().endswith("|"):
+                        left = left.rstrip() + " |"
+
+                    out_lines.append(left + " " + right2)
+                    i += 2
+                    continue
+
+        out_lines.append(ln)
+        i += 1
+
+    return "\n".join(out_lines)
+
+
 def extract_urgent_debt(text: str) -> str:
     """
     Принимает многосрочный текст с таблицей, находит строку с самой поздней датой
-    (формат dd-mm-yyyy или dd.mm.yyyy) и пытается извлечь сумму срочной задолженности
-    из третьей колонки слева (1 — дата, 2 — игнорируемое значение, 3 — сумма).
-    Если по колонкам не получается, использует fallback по списку чисел в строке.
-    Возвращает строку:
-    - "Срочная задолженность: <значение>"
-    - либо "Срочная задолженность: Н/Д", если ничего не найдено.
+    (формат dd-mm-yyyy или dd.mm.yyyy) и извлекает сумму срочной задолженности
+    из третьей колонки слева (1 — дата, 2 — слово Да/Нет/Н/Д, 3 — сумма).
+    Парсит ТОЛЬКО строки Markdown-таблицы (строки, начинающиеся с '|' после пробелов).
+    Если по колонкам не получается, возвращает "Срочная задолженность: Н/Д"
+    (чтобы сработал существующий LLM-fallback).
     """
     if not text:
         return "Срочная задолженность: Н/Д"
 
-    date_re = re.compile(r"\b(\d{2}[.-]\d{2}[.-]\d{4})\b")
+    text = _normalize_urgent_debt_table_rows(text)
+
     date_full_re = re.compile(r"^\d{2}[.-]\d{2}[.-]\d{4}$")
-    lines_with_dates = []
 
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
+    # Строгая проверка "денежного" числа в 3-й колонке:
+    # - обязательно запятая и ровно 2 цифры после неё
+    # - до запятой минимум 4 цифры (пробелы/nbsp как разделители тысяч допустимы)
+    money_re = re.compile(r"^\s*(\d[\d \u00A0\u202F]*)\s*,\s*(\d{2})\s*$")
+
+    def _is_md_separator_line(line: str) -> bool:
+        s = (line or "").strip()
+        if "|" not in s:
+            return False
+        tmp = s.replace("|", "").strip()
+        if not tmp:
+            return False
+        for ch in tmp:
+            if ch not in "-: ":
+                return False
+        return True
+
+    def _is_valid_money_cell(cell: str) -> bool:
+        if not cell:
+            return False
+        s = str(cell).strip()
+        m = money_re.fullmatch(s)
+        if not m:
+            return False
+        int_part = m.group(1) or ""
+        int_digits = re.sub(r"[ \u00A0\u202F]", "", int_part)
+        if len(int_digits) < 4:
+            return False
+        return int_digits.isdigit()
+
+    # 1) Препроцессинг: убираем строки-разделители Markdown таблиц
+    kept_lines: List[str] = []
+    for ln in text.splitlines():
+        if _is_md_separator_line(ln):
+            continue
+        kept_lines.append(ln)
+
+    # 2) Парсим ТОЛЬКО строки markdown-таблицы (начинаются с '|', имеют >= 3 колонки)
+    parsed_rows: List[tuple[datetime, str]] = []
+    for ln in kept_lines:
+        if not (ln or "").lstrip().startswith("|"):
+            continue
+        if (ln or "").count("|") < 4:
             continue
 
-        # Рассматриваем кандидатов ТОЛЬКО среди "правильных" табличных строк задолженности.
-        if "|" not in line:
-            continue
-        cols = [p.strip() for p in line.split("|") if p.strip()]
-        if not cols:
-            continue
-        if not date_full_re.fullmatch(cols[0]):
+        raw_parts = (ln or "").strip().split("|")
+        if raw_parts and raw_parts[0].strip() == "":
+            raw_parts = raw_parts[1:]
+        if raw_parts and raw_parts[-1].strip() == "":
+            raw_parts = raw_parts[:-1]
+
+        cells = [p.strip() for p in raw_parts]
+        if len(cells) < 3:
             continue
 
-        date_str = cols[0]
+        date_cell = cells[0]
+        if not date_full_re.fullmatch(date_cell):
+            continue
+
         try:
-            dt = datetime.strptime(date_str.replace(".", "-"), "%d-%m-%Y")
+            dt = datetime.strptime(date_cell.replace(".", "-"), "%d-%m-%Y")
         except ValueError:
             continue
 
-        lines_with_dates.append((dt, date_str, line, cols))
+        col3 = cells[2]
+        if not _is_valid_money_cell(col3):
+            continue
 
-    if not lines_with_dates:
+        parsed_rows.append((dt, col3.strip()))
+
+    if not parsed_rows:
         return "Срочная задолженность: Н/Д"
 
-    latest_dt, latest_date_str, latest_line, latest_cols = max(
-        lines_with_dates, key=lambda t: t[0]
-    )
-
-    value: Optional[str] = None
-
-    # 1) Попытка извлечения по третьей колонке (3-й столбец = cols[2])
-    if len(latest_cols) >= 3:
-        target_col = latest_cols[2].strip()
-        upper = target_col.upper().replace(" ", "")
-        if upper not in {"Н/Д", "H/Д"} and target_col:
-            m_num = re.search(r"\d[\d ]*(?:[.,]\d{2})?", target_col)
-            if m_num:
-                value = m_num.group(0).strip()
-
-    # 2) Fallback: по списку чисел в "хвостовых" колонках (только в выбранной правильной строке)
-    if value is None:
-        text_for_numbers = " | ".join(latest_cols[2:]) if len(latest_cols) >= 3 else ""
-        numbers = re.findall(r"\d[\d ]*(?:[.,]\d{2})?", text_for_numbers)
-        if numbers:
-            value = numbers[0].strip()
-
-    if value:
-        return f"Срочная задолженность: {value}"
+    _latest_dt, latest_value = max(parsed_rows, key=lambda t: t[0])
+    if latest_value:
+        return f"Срочная задолженность: {latest_value}"
 
     return "Срочная задолженность: Н/Д"
 
