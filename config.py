@@ -15,6 +15,7 @@ LOG_DIR = DATA_DIR / "logfiles"
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 FREE_API_KEY = os.getenv("FREE_API_KEY", "").strip()
 PAID_API_KEY = os.getenv("PAID_API_KEY", "").strip()
+GPT_API_KEY = os.getenv("GPT_API_KEY", "").strip()
 
 
 def _parse_admin_user_ids(raw: str) -> set[int]:
@@ -95,4 +96,5 @@ def make_llm_io_path(request_dir: Path, original_filename: str, request_ts: str)
     base_name = Path(original_filename).name
     llm_io_name = f"llm_io_{base_name}_{request_ts}.txt"
     return request_dir / llm_io_name
+
 

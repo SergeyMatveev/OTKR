@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from logging import Logger
 
-from telegram import Update
+from telegram import Update, InputFile
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -370,7 +370,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             return
 
         try:
-            report_messages = build_credit_report_from_csv(
+            report_messages, xlsx_path = build_credit_report_from_csv(
                 result_csv_path,
                 logger,
                 telegram_user_id=str(user_ctx["telegram_user_id"]),
@@ -419,10 +419,49 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await message.reply_text(
                 "Тестовая обработка завершена. Открытые кредиты по заданным правилам не найдены."
             )
+            try:
+                with open(xlsx_path, "rb") as f:
+                    await message.reply_document(document=InputFile(f, filename=xlsx_path.name))
+            except Exception as e:
+                logger.error(
+                    "Не удалось отправить xlsx %s: %s",
+                    xlsx_path,
+                    e,
+                    exc_info=True,
+                    extra={
+                        "stage": "test_xlsx_send_error",
+                        **user_ctx,
+                        "request_id": request_id,
+                        "duration_seconds": round(total_duration, 3),
+                        "model": "N/A",
+                        "api_key_id": "N/A",
+                        "file_name": file_name,
+                    },
+                )
             return
 
         for msg_text in report_messages:
             await message.reply_text(msg_text)
+
+        try:
+            with open(xlsx_path, "rb") as f:
+                await message.reply_document(document=InputFile(f, filename=xlsx_path.name))
+        except Exception as e:
+            logger.error(
+                "Не удалось отправить xlsx %s: %s",
+                xlsx_path,
+                e,
+                exc_info=True,
+                extra={
+                    "stage": "test_xlsx_send_error",
+                    **user_ctx,
+                    "request_id": request_id,
+                    "duration_seconds": round(total_duration, 3),
+                    "model": "N/A",
+                    "api_key_id": "N/A",
+                    "file_name": file_name,
+                },
+            )
 
         logger.info(
             "Тестовый текстовый отчёт отправлен пользователю %s: сообщений=%d.",
@@ -571,7 +610,7 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     # Формируем текстовый отчёт и отправляем пользователю
     try:
-        report_messages = build_credit_report_from_csv(
+        report_messages, xlsx_path = build_credit_report_from_csv(
             result_csv_path,
             logger,
             telegram_user_id=str(user_ctx["telegram_user_id"]),
@@ -620,10 +659,49 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await message.reply_text(
             "Обработка завершена. Открытые кредиты по заданным правилам не найдены."
         )
+        try:
+            with open(xlsx_path, "rb") as f:
+                await message.reply_document(document=InputFile(f, filename=xlsx_path.name))
+        except Exception as e:
+            logger.error(
+                "Не удалось отправить xlsx %s: %s",
+                xlsx_path,
+                e,
+                exc_info=True,
+                extra={
+                    "stage": "xlsx_send_error",
+                    **user_ctx,
+                    "request_id": request_id,
+                    "duration_seconds": round(total_duration, 3),
+                    "model": "N/A",
+                    "api_key_id": "N/A",
+                    "file_name": file_name,
+                },
+            )
         return
 
     for msg_text in report_messages:
         await message.reply_text(msg_text)
+
+    try:
+        with open(xlsx_path, "rb") as f:
+            await message.reply_document(document=InputFile(f, filename=xlsx_path.name))
+    except Exception as e:
+        logger.error(
+            "Не удалось отправить xlsx %s: %s",
+            xlsx_path,
+            e,
+            exc_info=True,
+            extra={
+                "stage": "xlsx_send_error",
+                **user_ctx,
+                "request_id": request_id,
+                "duration_seconds": round(total_duration, 3),
+                "model": "N/A",
+                "api_key_id": "N/A",
+                "file_name": file_name,
+            },
+        )
 
     logger.info(
         "Текстовый отчёт по открытым кредитам отправлен пользователю %s: сообщений=%d.",
@@ -659,7 +737,4 @@ def create_application(logger: Logger) -> Application:
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     return application
-
-
-
 

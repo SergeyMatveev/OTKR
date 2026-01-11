@@ -4,6 +4,7 @@ import json
 import random
 import time
 import re
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, Optional, List
@@ -25,6 +26,7 @@ PHRASE_POKUPATEL_BLOCK_START = (
 PHRASE_POKUPATEL_BLOCK_END = "Сведения о прекращении передачи сведений"
 
 MISTRAL_API_URL = "https://api.mistral.ai/v1/chat/completions"
+OPENAI_RESPONSES_API_URL = "https://api.openai.com/v1/responses"
 
 OUTPUT_COLUMNS = [
     "Номер",
@@ -36,9 +38,13 @@ OUTPUT_COLUMNS = [
     "Сумма и валюта",
     "Сумма задолженности",
     "УИд договора",
+    "Номер договора",
     "Приобретатель прав кредитора",
     "ИНН приобретателя прав кредитора",
+    "Страница",
 ]
+
+_LLM_IO_LOCK = threading.Lock()
 
 
 # ---------- утилиты для нормализации/парсинга ----------
@@ -53,7 +59,12 @@ def nd_normalize(val: Optional[str]) -> str:
 
 def ensure_allowed_prekr(val: str) -> str:
     v = nd_normalize(val)
-    allowed = {"Н/Д", "Надлежащее исполнение обязательства"}
+    allowed = {
+        "Н/Д",
+        "Надлежащее исполнение обязательства",
+        "Прощение долга",
+        "Иное основание",
+    }
     return v if v in allowed else "Н/Д"
 
 
@@ -108,7 +119,13 @@ def slice_500_before_phrase(text: str, phrase: str) -> str:
     if idx == -1:
         return ""
     start = max(0, idx - 500)
-    return text[start:idx]
+    chunk = text[start:idx]
+
+    pos = chunk.find("Задолженность")
+    if pos != -1:
+        chunk = chunk[pos:]
+
+    return chunk
 
 
 def slice_between(text: str, start_phrase: str, end_phrase: str) -> str:
@@ -142,6 +159,7 @@ def parse_stage2_response(raw: str) -> Dict[str, str]:
         "Дата сделки": "Н/Д",
         "Сумма и валюта": "Н/Д",
         "УИд договора": "Не найдено",
+        "Номер договора": "Н/Д",
     }
     if not raw:
         return result
@@ -151,6 +169,7 @@ def parse_stage2_response(raw: str) -> Dict[str, str]:
         "дата сделки": "Дата сделки",
         "сумма и валюта": "Сумма и валюта",
         "уид договора": "УИд договора",
+        "номер договора": "Номер договора",
     }
     for ln in lines:
         if ":" not in ln:
@@ -164,7 +183,7 @@ def parse_stage2_response(raw: str) -> Dict[str, str]:
         result["Прекращение обязательства"]
     )
     result["УИд договора"] = validate_uid(result["УИд договора"])
-    for k in ("Дата сделки", "Сумма и валюта"):
+    for k in ("Дата сделки", "Сумма и валюта", "Номер договора"):
         if not result[k] or not result[k].strip():
             result[k] = "Н/Д"
     return result
@@ -194,6 +213,285 @@ def is_valid_debt_value(val: str) -> bool:
         return False
     v_compact = v.replace(" ", "")
     return re.fullmatch(r"\d+(?:[.,]\d{2})?", v_compact) is not None
+
+
+def _extract_openai_output_text(data: object) -> str:
+    if not isinstance(data, dict):
+        return ""
+    out = data.get("output")
+    if not isinstance(out, list):
+        return ""
+    for item in out:
+        if not isinstance(item, dict):
+            continue
+        if item.get("type") != "message":
+            continue
+        if item.get("role") != "assistant":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for c in content:
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") == "output_text":
+                txt = c.get("text")
+                return txt if isinstance(txt, str) else ""
+    return ""
+
+
+def openai_responses_call(
+    *,
+    api_key: str,
+    model: str,
+    instructions: str,
+    user_content: str,
+    service_tier: Optional[str],
+    timeout_seconds: int,
+    llm_io_path: Optional[Path],
+    base_log_extra: Optional[Dict[str, object]],
+    stats: Optional[FileStats],
+) -> tuple[str, bool, Optional[int], Optional[str], Optional[str]]:
+    """
+    Один вызов OpenAI Responses API.
+    Возвращает: (assistant_text, ok, http_status_code, error_type, error_code).
+    Всегда пишет llm_io_...txt через log_llm_call (и lock), подавляя ошибки логирования.
+    """
+    tier_label = "flex" if service_tier == "flex" else "default"
+    request_text_for_io = (
+        "[INSTRUCTIONS]\n"
+        f"{instructions or ''}\n\n"
+        "[USER CONTENT]\n"
+        f"{user_content or ''}\n\n"
+        "[SERVICE_TIER]\n"
+        f"{tier_label}"
+    )
+
+    base = base_log_extra or {}
+
+    request_id = str(base.get("request_id", "N/A"))
+    telegram_user_id = str(base.get("telegram_user_id", "N/A"))
+    telegram_username = str(base.get("telegram_username", "N/A"))
+    pdf_filename = str(base.get("file_name", "N/A"))
+
+    path_obj = llm_io_path
+    if path_obj is None:
+        tmp = base.get("llm_io_path")
+        if isinstance(tmp, str):
+            path_obj = Path(tmp)
+        elif isinstance(tmp, Path):
+            path_obj = tmp
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    payload: Dict[str, object] = {
+        "model": model,
+        "instructions": instructions or "",
+        "input": user_content or "",
+    }
+    if service_tier:
+        payload["service_tier"] = service_tier
+
+    send_start = time.perf_counter()
+
+    try:
+        resp = requests.post(
+            OPENAI_RESPONSES_API_URL,
+            headers=headers,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            timeout=timeout_seconds,
+        )
+    except requests.exceptions.Timeout:
+        call_duration = time.perf_counter() - send_start
+        if path_obj is not None:
+            try:
+                with _LLM_IO_LOCK:
+                    log_llm_call(
+                        path_obj,
+                        request_id=request_id,
+                        telegram_user_id=telegram_user_id,
+                        telegram_username=telegram_username,
+                        pdf_filename=pdf_filename,
+                        model=model,
+                        api_key_id="GPT_API_KEY",
+                        request_text=request_text_for_io,
+                        response_text="timeout",
+                        latency_seconds=call_duration,
+                        status="error",
+                        error_type="Timeout",
+                        error_code="timeout",
+                    )
+            except Exception:
+                pass
+
+        if stats is not None:
+            try:
+                stats.register_llm_call(
+                    model=model,
+                    api_key_id="GPT_API_KEY",
+                    request_text=request_text_for_io,
+                    response_text="timeout",
+                    latency_seconds=call_duration,
+                )
+            except Exception:
+                pass
+
+        return "", False, None, "Timeout", "timeout"
+    except Exception as e:
+        call_duration = time.perf_counter() - send_start
+        err_txt = str(e)[:1000]
+        if path_obj is not None:
+            try:
+                with _LLM_IO_LOCK:
+                    log_llm_call(
+                        path_obj,
+                        request_id=request_id,
+                        telegram_user_id=telegram_user_id,
+                        telegram_username=telegram_username,
+                        pdf_filename=pdf_filename,
+                        model=model,
+                        api_key_id="GPT_API_KEY",
+                        request_text=request_text_for_io,
+                        response_text=err_txt,
+                        latency_seconds=call_duration,
+                        status="error",
+                        error_type=type(e).__name__,
+                        error_code=None,
+                    )
+            except Exception:
+                pass
+
+        if stats is not None:
+            try:
+                stats.register_llm_call(
+                    model=model,
+                    api_key_id="GPT_API_KEY",
+                    request_text=request_text_for_io,
+                    response_text=err_txt,
+                    latency_seconds=call_duration,
+                )
+            except Exception:
+                pass
+
+        return "", False, None, type(e).__name__, None
+
+    call_duration = time.perf_counter() - send_start
+
+    if resp.status_code == 200:
+        try:
+            data = resp.json()
+        except Exception as e:
+            body = (resp.text or "")[:1000]
+            err_txt = f"JSON parse error: {str(e)}. Raw body: {body}"
+            if path_obj is not None:
+                try:
+                    with _LLM_IO_LOCK:
+                        log_llm_call(
+                            path_obj,
+                            request_id=request_id,
+                            telegram_user_id=telegram_user_id,
+                            telegram_username=telegram_username,
+                            pdf_filename=pdf_filename,
+                            model=model,
+                            api_key_id="GPT_API_KEY",
+                            request_text=request_text_for_io,
+                            response_text=err_txt,
+                            latency_seconds=call_duration,
+                            status="error",
+                            error_type=type(e).__name__,
+                            error_code=None,
+                        )
+                except Exception:
+                    pass
+
+            if stats is not None:
+                try:
+                    stats.register_llm_call(
+                        model=model,
+                        api_key_id="GPT_API_KEY",
+                        request_text=request_text_for_io,
+                        response_text=err_txt,
+                        latency_seconds=call_duration,
+                    )
+                except Exception:
+                    pass
+
+            return "", False, 200, type(e).__name__, None
+
+        text = _extract_openai_output_text(data).strip()
+
+        if path_obj is not None:
+            try:
+                with _LLM_IO_LOCK:
+                    log_llm_call(
+                        path_obj,
+                        request_id=request_id,
+                        telegram_user_id=telegram_user_id,
+                        telegram_username=telegram_username,
+                        pdf_filename=pdf_filename,
+                        model=model,
+                        api_key_id="GPT_API_KEY",
+                        request_text=request_text_for_io,
+                        response_text=text,
+                        latency_seconds=call_duration,
+                        status="success",
+                        error_type=None,
+                        error_code=None,
+                    )
+            except Exception:
+                pass
+
+        if stats is not None:
+            try:
+                stats.register_llm_call(
+                    model=model,
+                    api_key_id="GPT_API_KEY",
+                    request_text=request_text_for_io,
+                    response_text=text,
+                    latency_seconds=call_duration,
+                )
+            except Exception:
+                pass
+
+        return text, True, 200, None, None
+
+    body = (resp.text or "")[:1000]
+    if path_obj is not None:
+        try:
+            with _LLM_IO_LOCK:
+                log_llm_call(
+                    path_obj,
+                    request_id=request_id,
+                    telegram_user_id=telegram_user_id,
+                    telegram_username=telegram_username,
+                    pdf_filename=pdf_filename,
+                    model=model,
+                    api_key_id="GPT_API_KEY",
+                    request_text=request_text_for_io,
+                    response_text=body,
+                    latency_seconds=call_duration,
+                    status="error",
+                    error_type="HTTPError",
+                    error_code=str(resp.status_code),
+                )
+        except Exception:
+            pass
+
+    if stats is not None:
+        try:
+            stats.register_llm_call(
+                model=model,
+                api_key_id="GPT_API_KEY",
+                request_text=request_text_for_io,
+                response_text=body,
+                latency_seconds=call_duration,
+            )
+        except Exception:
+            pass
+
+    return "", False, resp.status_code, "HTTPError", str(resp.status_code)
 
 
 def _normalize_urgent_debt_table_rows(text: str) -> str:
@@ -594,6 +892,8 @@ class MistralChatClient:
 
         attempt = 0
         last_err = None
+        force_free_next_attempt: bool = False
+        last_key_label = self.current_label
 
         base_extra = self.base_log_extra or {}
         llm_io_path = base_extra.get("llm_io_path")
@@ -609,10 +909,20 @@ class MistralChatClient:
 
         while attempt <= max_retries:
             attempt += 1
-            key_label = self.current_label
+
+            if force_free_next_attempt:
+                key_label = "FREE"
+                key_to_use = self.free_key
+                force_free_next_attempt = False
+            else:
+                key_label = self.current_label
+                key_to_use = self.current_key
+
+            last_key_label = key_label
+
             headers = {
                 **headers_base,
-                "Authorization": f"Bearer {self.current_key}",
+                "Authorization": f"Bearer {key_to_use}",
             }
 
             send_start = time.perf_counter()
@@ -743,8 +1053,40 @@ class MistralChatClient:
                 )
                 return text
 
-            # Ошибки сервера
-            if resp.status_code in (429, 500, 502, 503, 504):
+            # HTTP 429 (rate limit): cooldown 30s и повтор ТОГО ЖЕ запроса, принудительно на FREE
+            if resp.status_code == 429:
+                body = resp.text[:1000]
+                last_err = f"HTTP {resp.status_code}: {body}"
+                self.logger.error(
+                    "[%s] Rate limit (HTTP 429) от Mistral для строки %d: %s",
+                    stage,
+                    row_index,
+                    last_err,
+                    extra={
+                        **self.base_log_extra,
+                        "stage": f"{stage}_llm_error",
+                        "duration_seconds": round(call_duration, 3),
+                        "model": model_name,
+                        "api_key_id": f"{key_label}_API_KEY",
+                    },
+                )
+                self._log_llm_io(
+                    llm_io_path=llm_io_path,
+                    model_name=model_name,
+                    api_key_label=key_label,
+                    request_text=request_text_for_io,
+                    response_text=body,
+                    latency_seconds=call_duration,
+                    status="error",
+                    error_type="HTTPError",
+                    error_code="429",
+                )
+                time.sleep(30)
+                force_free_next_attempt = True
+                continue
+
+            # Ошибки сервера (НЕ 429)
+            if resp.status_code in (500, 502, 503, 504):
                 body = resp.text[:1000]
                 last_err = f"HTTP {resp.status_code}: {body}"
                 self.logger.error(
@@ -820,8 +1162,7 @@ class MistralChatClient:
                 "stage": f"{stage}_llm_error",
                 "duration_seconds": 0,
                 "model": model_name,
-                "api_key_id": f"{self.current_label}_API_KEY",
+                "api_key_id": f"{last_key_label}_API_KEY",
             },
         )
         return ""
-

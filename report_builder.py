@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import List, Dict
 from logging import Logger
@@ -78,6 +79,21 @@ def _normalize_inn(value: object) -> str:
     return "Н/Д"
 
 
+def _normalize_page(value: object) -> str:
+    if value is None:
+        return "Н/Д"
+    if isinstance(value, float) and pd.isna(value):
+        return "Н/Д"
+    s = str(value).strip()
+    if not s or s.upper() == "Н/Д":
+        return "Н/Д"
+    try:
+        n = int(float(s.replace(" ", "").replace(",", ".")))
+        return str(n) if n > 0 else "Н/Д"
+    except Exception:
+        return s or "Н/Д"
+
+
 def _normalize_amount(value: object) -> str:
     """
     Приводит строку с числом к формату ХХХХХ,YY.
@@ -127,6 +143,82 @@ def _format_debt(value: object) -> str:
     return _normalize_amount(value)
 
 
+def _group_thousands_spaces(amount_str: str) -> str:
+    if not amount_str:
+        return "Н/Д"
+    s = str(amount_str).strip()
+    if not s or s.upper() == "Н/Д":
+        return "Н/Д"
+
+    if "," in s:
+        int_part, frac_part = s.split(",", 1)
+        has_frac = True
+    else:
+        int_part, frac_part = s, ""
+        has_frac = False
+
+    sign = ""
+    digits = int_part
+    if digits.startswith("-"):
+        sign = "-"
+        digits = digits[1:]
+
+    if len(digits) <= 3:
+        grouped = sign + digits
+    else:
+        parts: List[str] = []
+        i = len(digits)
+        while i > 0:
+            start = max(0, i - 3)
+            parts.append(digits[start:i])
+            i = start
+        grouped = sign + " ".join(reversed(parts))
+
+    if has_frac:
+        return f"{grouped},{frac_part}"
+    return grouped
+
+
+def _drop_fraction(amount_str: str) -> str:
+    if not amount_str:
+        return "Н/Д"
+    s = str(amount_str).strip()
+    if not s or s.upper() == "Н/Д":
+        return "Н/Д"
+    if "," in s:
+        return s.split(",", 1)[0]
+    return s
+
+
+def _format_sum_with_currency_for_telegram(value: object) -> str:
+    norm = _normalize_amount(value)
+    if norm == "Н/Д":
+        return "Н/Д"
+    return f"{_group_thousands_spaces(norm)} RUB"
+
+
+def _format_debt_for_telegram(value: object) -> str:
+    norm = _normalize_amount(value)
+    if norm == "Н/Д":
+        return "Н/Д"
+    return _group_thousands_spaces(norm)
+
+
+def _format_sum_with_currency_for_excel(value: object) -> str:
+    norm = _normalize_amount(value)
+    if norm == "Н/Д":
+        return "Н/Д"
+    integer = _drop_fraction(norm)
+    return f"{_group_thousands_spaces(integer)} RUB"
+
+
+def _format_debt_for_excel(value: object) -> str:
+    norm = _normalize_amount(value)
+    if norm == "Н/Д":
+        return "Н/Д"
+    return norm.replace(",", ".")
+
+
 def build_credit_report_from_csv(
     csv_path: Path,
     logger: Logger,
@@ -135,10 +227,10 @@ def build_credit_report_from_csv(
     telegram_username: str,
     request_id: str,
     file_name: str,
-) -> List[str]:
+) -> tuple[List[str], Path]:
     """
     Загружает итоговый CSV, добавляет колонку "Решение",
-    формирует текстовый отчёт по открытым кредитам и возвращает список сообщений.
+    формирует текстовый отчёт по открытым кредитам и возвращает список сообщений + путь к xlsx.
     """
     csv_path = csv_path.resolve()
     overall_start = time.perf_counter()
@@ -151,6 +243,17 @@ def build_credit_report_from_csv(
         "api_key_id": "N/A",
         "file_name": file_name,
     }
+
+    xlsx_path = csv_path.parent / f"{datetime.now():%Y-%m-%d-%H-%M-%S}-{Path(file_name).stem}.xlsx"
+    excel_columns = [
+        "Страница",
+        "Название",
+        "ИНН",
+        "Дата сделки",
+        "Сумма и валюта",
+        "Текущая задолженность",
+        "УИд договора",
+    ]
 
     logger.info(
         "Построение текстового отчёта по CSV %s начато.",
@@ -188,23 +291,57 @@ def build_credit_report_from_csv(
         decisions[idx] = ""
         use_acquirer[idx] = False
 
+    closed_uids = set()
+    for idx in df.index:
+        row = df.loc[idx]
+        prekr = str(row.get("Прекращение обязательства", "") or "").strip()
+        uid_val = str(row.get("УИд договора", "") or "").strip()
+        if (
+            prekr in {"Надлежащее исполнение обязательства", "Прощение долга", "Иное основание"}
+            and uid_val != ""
+            and uid_val != "Не найдено"
+        ):
+            closed_uids.add(uid_val)
+
     # Шаг 1: базовый фильтр по "Прекращение обязательства"
     uid_groups: Dict[str, List[object]] = {}
 
     for idx in df.index:
         row = df.loc[idx]
+
+        debt_val = row.get("Сумма задолженности", "")
+        if _is_nd(debt_val):
+            decisions[idx] = "Исключен. Задолженность Н/Д"
+            use_acquirer[idx] = False
+            continue
+
         prekr = str(row.get("Прекращение обязательства", "") or "").strip()
         uid_val = str(row.get("УИд договора", "") or "").strip()
+
+        if (
+            prekr == "Н/Д"
+            and uid_val != ""
+            and uid_val != "Не найдено"
+            and uid_val in closed_uids
+        ):
+            decisions[idx] = "Исключен. Такой же Уид был закрыт"
+            use_acquirer[idx] = False
+            continue
 
         if prekr != "Н/Д":
             if prekr == "Надлежащее исполнение обязательства":
                 decisions[idx] = "Исключен. Надлежащее исполнение обязательства"
+            elif prekr == "Прощение долга":
+                decisions[idx] = "Исключен. Прощение долга"
+            elif prekr == "Иное основание":
+                decisions[idx] = "Исключен. Иное основание"
             else:
                 decisions[idx] = "Исключен. Не попал в правила отбора"
 
         if prekr == "Н/Д":
             if uid_val == "" or uid_val == "Не найдено":
-                decisions[idx] = "Исключен. Не найден УИд договора"
+                decisions[idx] = "Добавлен"
+                use_acquirer[idx] = False
             else:
                 uid_groups.setdefault(uid_val, []).append(idx)
 
@@ -261,6 +398,10 @@ def build_credit_report_from_csv(
                 decisions[idx] = "Исключен. Не попал в правила отбора"
             elif prekr == "Надлежащее исполнение обязательства":
                 decisions[idx] = "Исключен. Надлежащее исполнение обязательства"
+            elif prekr == "Прощение долга":
+                decisions[idx] = "Исключен. Прощение долга"
+            elif prekr == "Иное основание":
+                decisions[idx] = "Исключен. Иное основание"
             else:
                 decisions[idx] = "Исключен. Не попал в правила отбора"
 
@@ -309,7 +450,9 @@ def build_credit_report_from_csv(
                 "duration_seconds": round(duration, 3),
             },
         )
-        return []
+        df_excel = pd.DataFrame([], columns=excel_columns)
+        df_excel.to_excel(xlsx_path, index=False)
+        return [], xlsx_path
 
     # Группировка "добавленных" строк по финальному ИНН
     groups: Dict[str, Dict[str, object]] = {}
@@ -355,6 +498,7 @@ def build_credit_report_from_csv(
                 "idx": idx,
                 "number": row.get("Номер", ""),
                 "uid": str(row.get("УИд договора", "") or ""),
+                "page": _normalize_page(row.get("Страница", "Н/Д")),
                 "date": str(row.get("Дата сделки", "") or "Н/Д"),
                 "sum_text": row.get("Сумма и валюта", "Н/Д"),
                 "debt_text": row.get("Сумма задолженности", "Н/Д"),
@@ -365,7 +509,9 @@ def build_credit_report_from_csv(
     from string import ascii_uppercase
 
     blocks: List[str] = []
+    excel_rows: List[Dict[str, str]] = []
     block_index = 0
+    total_debt = Decimal("0.00")
 
     for inn_key in order_final_inn:
         group = groups[inn_key]
@@ -385,6 +531,32 @@ def build_credit_report_from_csv(
         final_name = group["final_name"]
         final_inn = group["final_inn"]
 
+        for r in rows:
+            page_val = r.get("page") or "Н/Д"
+            date = r["date"] or "Н/Д"
+            sum_str = _format_sum_with_currency_for_excel(r["sum_text"])
+            debt_str = _format_debt_for_excel(r["debt_text"])
+            uid_val = r["uid"] or "Н/Д"
+
+            debt_norm_for_total = _normalize_amount(r["debt_text"])
+            if debt_norm_for_total != "Н/Д":
+                try:
+                    total_debt += Decimal(debt_norm_for_total.replace(",", "."))
+                except Exception:
+                    pass
+
+            excel_rows.append(
+                {
+                    "Страница": page_val,
+                    "Название": final_name,
+                    "ИНН": final_inn,
+                    "Дата сделки": date,
+                    "Сумма и валюта": sum_str,
+                    "Текущая задолженность": debt_str,
+                    "УИд договора": uid_val,
+                }
+            )
+
         block_lines: List[str] = []
         block_lines.append(f"{block_index}. Кредитор:")
         block_lines.append(f"    Наименование: {final_name}")
@@ -392,12 +564,14 @@ def build_credit_report_from_csv(
 
         if len(rows) == 1:
             r = rows[0]
+            page_val = r.get("page") or "Н/Д"
             date = r["date"] or "Н/Д"
-            sum_str = _format_sum_with_currency(r["sum_text"])
-            debt_str = _format_debt(r["debt_text"])
+            sum_str = _format_sum_with_currency_for_telegram(r["sum_text"])
+            debt_str = _format_debt_for_telegram(r["debt_text"])
             uid_val = r["uid"] or "Н/Д"
 
             block_lines.append("    Договор:")
+            block_lines.append(f"        Страница в ПДФ: {page_val}")
             block_lines.append(f"        Дата сделки: {date}")
             block_lines.append(f"        Сумма и валюта: {sum_str}")
             block_lines.append(f"        Текущая задолженность: {debt_str}")
@@ -405,12 +579,14 @@ def build_credit_report_from_csv(
         else:
             for i, r in enumerate(rows):
                 label = ascii_uppercase[i] if i < len(ascii_uppercase) else str(i + 1)
+                page_val = r.get("page") or "Н/Д"
                 date = r["date"] or "Н/Д"
-                sum_str = _format_sum_with_currency(r["sum_text"])
-                debt_str = _format_debt(r["debt_text"])
+                sum_str = _format_sum_with_currency_for_telegram(r["sum_text"])
+                debt_str = _format_debt_for_telegram(r["debt_text"])
                 uid_val = r["uid"] or "Н/Д"
 
                 block_lines.append(f"    Договор {label}:")
+                block_lines.append(f"        Страница в ПДФ: {page_val}")
                 block_lines.append(f"        Дата сделки: {date}")
                 block_lines.append(f"        Сумма и валюта: {sum_str}")
                 block_lines.append(f"        Текущая задолженность: {debt_str}")
@@ -427,6 +603,20 @@ def build_credit_report_from_csv(
 
         block_text = "\n".join(block_lines).rstrip()
         blocks.append(block_text)
+
+    total_debt_rounded = total_debt.quantize(Decimal("0.01"))
+    total_debt_excel = format(total_debt_rounded, "f")
+    excel_rows.append(
+        {
+            "Страница": "",
+            "Название": "",
+            "ИНН": "",
+            "Дата сделки": "",
+            "Сумма и валюта": "",
+            "Текущая задолженность": total_debt_excel,
+            "УИд договора": "",
+        }
+    )
 
     # Разбиение блоков на сообщения по лимиту 4000 символов
     messages: List[str] = []
@@ -447,6 +637,11 @@ def build_credit_report_from_csv(
     if current_blocks:
         messages.append("\n\n".join(current_blocks))
 
+    total_debt_msg = _group_thousands_spaces(format(total_debt_rounded, "f").replace(".", ","))
+    messages.append(
+        f"Общая задолженность {total_debt_msg} рублей. Возможны ошибки, пожалуйста, проверяйте информацию."
+    )
+
     duration = time.perf_counter() - overall_start
     logger.info(
         "Построение текстового отчёта завершено: блоков=%d, сообщений=%d.",
@@ -459,6 +654,10 @@ def build_credit_report_from_csv(
         },
     )
 
-    return messages
+    df_excel = pd.DataFrame(excel_rows, columns=excel_columns)
+    df_excel.to_excel(xlsx_path, index=False)
+
+    return messages, xlsx_path
+
 
 

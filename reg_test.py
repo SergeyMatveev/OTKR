@@ -17,7 +17,7 @@ from report_builder import build_credit_report_from_csv
 from llm_support import extract_urgent_debt, parse_stage4_response
 
 
-TEST_MD_PATH = Path("tests/test1.md")
+TEST_MD_PATH = Path("tests/test_tugusheva.md")
 EXPECTED_CSV_PATH = Path("tests/result1.csv")
 
 TEST_TELEGRAM_USER_ID = "464483163"

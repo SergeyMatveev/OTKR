@@ -151,7 +151,10 @@ def run_markdown_to_chunks(
             },
         )
         raise ValueError(msg)
-    start_idx = start_match.start()
+
+    start_pos = start_match.start()
+    marker_pos = full_text.rfind("@@@PAGE:", 0, start_pos)
+    start_idx = marker_pos if marker_pos != -1 else start_pos
 
     corpus = full_text[start_idx:]
     corpus_path = request_dir / f"{original_base}_corpus_{request_ts}.txt"
@@ -174,6 +177,23 @@ def run_markdown_to_chunks(
             "file_name": corpus_path.name,
         },
     )
+
+    PAGE_MARKER_RE = re.compile(r"@@@PAGE:\s*(\d+)@@@")
+    page_markers: List[tuple[int, int]] = []
+    for mm in PAGE_MARKER_RE.finditer(corpus):
+        try:
+            page_markers.append((mm.start(), int(mm.group(1))))
+        except Exception:
+            pass
+
+    def get_page_for_pos(pos: int) -> Optional[int]:
+        last_page: Optional[int] = None
+        for mpos, pnum in page_markers:
+            if mpos <= pos:
+                last_page = pnum
+            else:
+                break
+        return last_page
 
     # Разбивка на «сырые» чанки
     CHUNK_HEADING_RE = re.compile(
@@ -201,11 +221,27 @@ def run_markdown_to_chunks(
         return fix_ooo_in_text(h.strip())
 
     raw_chunks: List[Dict[str, Any]] = []
+    first_start = raw_matches[0].start()
+    if first_start > 0:
+        pre_text = fix_ooo_in_text(corpus[:first_start])
+        raw_chunks.append(
+            {
+                "raw_id": 0,
+                "start_idx": 0,
+                "end_idx": first_start,
+                "length": first_start,
+                "heading": "",
+                "text": pre_text,
+                "is_preamble": True,
+            }
+        )
+
     for i, m in enumerate(raw_matches):
         s = m.start()
         e = raw_matches[i + 1].start() if i + 1 < len(raw_matches) else len(corpus)
         text_i = fix_ooo_in_text(corpus[s:e])
         heading_line = clean_heading_line(m.group(0)) or ""
+        page = get_page_for_pos(s)
         raw_chunks.append(
             {
                 "raw_id": i + 1,
@@ -214,6 +250,7 @@ def run_markdown_to_chunks(
                 "length": e - s,
                 "heading": heading_line,
                 "text": text_i,
+                "page": page,
             }
         )
 
@@ -306,6 +343,8 @@ def run_markdown_to_chunks(
     invalid_chunks: List[Dict[str, Any]] = []
 
     for rc in raw_chunks:
+        if rc.get("is_preamble"):
+            continue
         has_uid = UID_RE.search(rc["text"]) is not None
         hnum = extract_heading_number(rc["heading"] or "")
         item = {"heading_num": hnum, **rc, "has_uid": has_uid}
@@ -415,6 +454,7 @@ def run_markdown_to_chunks(
                 "length": c["length"],
                 "heading": c["heading"],
                 "text": c["text"],
+                "page": c.get("page"),
             }
         else:
             # Невалидный блок: приклеиваем к предыдущему валидному, если он есть
@@ -444,6 +484,7 @@ def run_markdown_to_chunks(
                 "length": c["length"],
                 "heading": c["heading"],
                 "text": c["text"],
+                "page": c.get("page"),
             }
         )
 
@@ -457,6 +498,7 @@ def run_markdown_to_chunks(
             "length",
             "heading",
             "text",
+            "page",
         ],
     )
     chunks_csv_path = request_dir / f"{original_base}_chunks_{request_ts}.csv"
@@ -549,3 +591,4 @@ def run_markdown_to_chunks(
         "chunks_txt": chunks_txt_path,
         "invalid_chunks": invalid_txt_path,
     }
+

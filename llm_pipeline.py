@@ -13,10 +13,10 @@ import pandas as pd
 
 from logging import Logger
 
-from config import FREE_API_KEY, PAID_API_KEY, make_llm_io_path
+from config import FREE_API_KEY, PAID_API_KEY, GPT_API_KEY, make_llm_io_path
 from logging_setup import FileStats
 
-from llm_prompts import SYSTEM_PROMPT_STAGE2, PROMPT_STAGE5, SYSTEM_PROMPT_INN_FALLBACK, SYSTEM_PROMPT_STAGE4_FALLBACK
+from llm_prompts import SYSTEM_PROMPT_STAGE2, PROMPT_STAGE5, SYSTEM_PROMPT_INN_FALLBACK, SYSTEM_PROMPT_STAGE4
 from llm_support import (
     PHRASE_SVEDENIYA_ISPOLN,
     PHRASE_SOURCE_CREDIT_HISTORY,
@@ -39,6 +39,7 @@ from llm_support import (
     is_valid_debt_value,
     extract_urgent_debt,
     parse_stage5_response,
+    openai_responses_call,
 )
 
 
@@ -131,6 +132,16 @@ def run_llm_pipeline(
         block_text = str(row.get("text", "") or "")
         title = extract_header_line(block_text)
         short_name = extract_short_title(title)
+
+        page_raw = row.get("page", None)
+        page_val = "Н/Д"
+        if page_raw is not None and not pd.isna(page_raw):
+            try:
+                page_val_int = int(float(str(page_raw).strip()))
+                page_val = str(page_val_int) if page_val_int > 0 else "Н/Д"
+            except Exception:
+                page_val = "Н/Д"
+
         base_rows.append(
             {
                 "Номер": str(len(base_rows) + 1),
@@ -142,8 +153,10 @@ def run_llm_pipeline(
                 "Сумма и валюта": "Н/Д",
                 "Сумма задолженности": "Н/Д",
                 "УИд договора": "Не найдено",
+                "Номер договора": "Н/Д",
                 "Приобретатель прав кредитора": "Н/Д",
                 "ИНН приобретателя прав кредитора": "Н/Д",
+                "Страница": page_val,
             }
         )
     main_df = pd.DataFrame(base_rows, columns=OUTPUT_COLUMNS)
@@ -188,12 +201,48 @@ def run_llm_pipeline(
             "telegram_username": telegram_username,
             "request_id": request_id,
             "duration_seconds": 0,
-            "model": "mistral-small-latest",
-            "api_key_id": "FREE_API_KEY",
+            "model": "gpt-5.1",
+            "api_key_id": "GPT_API_KEY",
             "file_name": original_pdf_name,
         },
     )
     stage2_start = time.perf_counter()
+
+    if not GPT_API_KEY:
+        raise RuntimeError("GPT_API_KEY не задан в .env, невозможны запросы к OpenAI (Stage2).")
+
+    def _call_stage2(payload: str) -> str:
+        resp_text, ok, _status_code, error_type, _error_code = openai_responses_call(
+            api_key=GPT_API_KEY,
+            model="gpt-5.1",
+            instructions=SYSTEM_PROMPT_STAGE2,
+            user_content=payload,
+            service_tier="flex",
+            timeout_seconds=10,
+            llm_io_path=llm_io_path,
+            base_log_extra=base_log_extra,
+            stats=file_stats,
+        )
+
+        if (not ok) and (error_type == "Timeout"):
+            resp_text2, ok2, _status_code2, _error_type2, _error_code2 = openai_responses_call(
+                api_key=GPT_API_KEY,
+                model="gpt-5.1",
+                instructions=SYSTEM_PROMPT_STAGE2,
+                user_content=payload,
+                service_tier=None,
+                timeout_seconds=30,
+                llm_io_path=llm_io_path,
+                base_log_extra=base_log_extra,
+                stats=file_stats,
+            )
+            if ok2:
+                return resp_text2
+            return ""
+
+        if ok:
+            return resp_text
+        return ""
 
     idxs_stage2: List[int] = list(chunks_df.index)
     if idxs_stage2:
@@ -207,14 +256,8 @@ def run_llm_pipeline(
 
                 futures_map[
                     ex.submit(
-                        chat_client.chat,
-                        "mistral-small-latest",
-                        SYSTEM_PROMPT_STAGE2,
+                        _call_stage2,
                         part_for_stage2,
-                        "stage2",
-                        idx,
-                        number,
-                        title,
                     )
                 ] = idx
 
@@ -234,8 +277,8 @@ def run_llm_pipeline(
                             "telegram_username": telegram_username,
                             "request_id": request_id,
                             "duration_seconds": 0,
-                            "model": "mistral-small-latest",
-                            "api_key_id": "N/A",
+                            "model": "gpt-5.1",
+                            "api_key_id": "GPT_API_KEY",
                             "file_name": original_pdf_name,
                         },
                     )
@@ -247,6 +290,7 @@ def run_llm_pipeline(
                 main_df.at[idx, "Дата сделки"] = parsed["Дата сделки"]
                 main_df.at[idx, "Сумма и валюта"] = parsed["Сумма и валюта"]
                 main_df.at[idx, "УИд договора"] = parsed["УИд договора"]
+                main_df.at[idx, "Номер договора"] = parsed["Номер договора"]
 
     stage2_duration = time.perf_counter() - stage2_start
     need_more = main_df["Прекращение обязательства"] == "Н/Д"
@@ -260,7 +304,7 @@ def run_llm_pipeline(
             "telegram_username": telegram_username,
             "request_id": request_id,
             "duration_seconds": round(stage2_duration, 3),
-            "model": "mistral-small-latest",
+            "model": "gpt-5.1",
             "api_key_id": "N/A",
             "file_name": original_pdf_name,
         },
@@ -382,9 +426,9 @@ def run_llm_pipeline(
         },
     )
 
-    # Этап 4: срочная задолженность (локальный парсер + LLM-fallback)
+    # Этап 4: срочная задолженность (GPT-5.1 flex -> fallback)
     logger.info(
-        "Этап 4: расчёт 'Сумма задолженности' (локальный парсер + LLM-fallback).",
+        "Этап 4: расчёт 'Сумма задолженности' (GPT-5.1 flex -> fallback).",
         extra={
             "stage": "llm_stage4_start",
             "telegram_user_id": telegram_user_id,
@@ -397,106 +441,95 @@ def run_llm_pipeline(
         },
     )
     stage4_start = time.perf_counter()
-    fallback_idxs: List[int] = []
-    fallback_payloads: Dict[int, str] = {}
 
-    for idx in main_df.index[need_more]:
+    if not GPT_API_KEY:
+        raise RuntimeError("GPT_API_KEY не задан в .env, невозможны запросы к OpenAI (Stage4).")
+
+    idxs_stage4: List[int] = list(main_df.index[need_more])
+    stage4_payloads: Dict[int, str] = {}
+
+    for idx in idxs_stage4:
         full_block = str(chunks_df.at[idx, "text"] or "")
         slice_500 = slice_500_before_phrase(full_block, PHRASE_SROCHNAYA_ZADOLZH)
         if not slice_500:
             main_df.at[idx, "Сумма задолженности"] = "Н/Д"
             continue
+        stage4_payloads[idx] = slice_500
 
-        resp_text_local = extract_urgent_debt(slice_500)
-        value_local = nd_normalize(parse_stage4_response(resp_text_local))
-        if is_valid_debt_value(value_local):
-            main_df.at[idx, "Сумма задолженности"] = value_local
-        else:
-            main_df.at[idx, "Сумма задолженности"] = "Н/Д"
-            fallback_idxs.append(idx)
-            fallback_payloads[idx] = slice_500
+    def _extract_first_number_or_nd(s: str) -> str:
+        if not s:
+            return "Н/Д"
+        m = re.search(r"\d[\d \u00A0\u202F]*(?:[.,]\d{2})?", s)
+        if not m:
+            return "Н/Д"
+        num = m.group(0)
+        num = num.replace("\u00A0", " ").replace("\u202F", " ").strip()
+        return num or "Н/Д"
 
-    # LLM-fallback только для тех строк, где локальный парсер не дал валидного числа
-    if fallback_idxs:
-        logger.info(
-            "Этап 4: LLM-fallback для 'Сумма задолженности' будет выполнен для %d строк.",
-            len(fallback_idxs),
-            extra={
-                "stage": "llm_stage4_fallback_start",
-                "telegram_user_id": telegram_user_id,
-                "telegram_username": telegram_username,
-                "request_id": request_id,
-                "duration_seconds": 0,
-                "model": "mistral-small-latest",
-                "api_key_id": "FREE_API_KEY",
-                "file_name": original_pdf_name,
-            },
+    def _call_stage4_model(model_name: str, payload: str) -> str:
+        resp_text, ok, status_code, error_type, _error_code = openai_responses_call(
+            api_key=GPT_API_KEY,
+            model=model_name,
+            instructions=SYSTEM_PROMPT_STAGE4,
+            user_content=payload,
+            service_tier="flex",
+            timeout_seconds=15,
+            llm_io_path=llm_io_path,
+            base_log_extra=base_log_extra,
+            stats=file_stats,
         )
-        fallback_start = time.perf_counter()
+
+        if (not ok) and ((status_code == 429) or (error_type == "Timeout")):
+            resp_text2, ok2, _status_code2, _error_type2, _error_code2 = openai_responses_call(
+                api_key=GPT_API_KEY,
+                model=model_name,
+                instructions=SYSTEM_PROMPT_STAGE4,
+                user_content=payload,
+                service_tier=None,
+                timeout_seconds=30,
+                llm_io_path=llm_io_path,
+                base_log_extra=base_log_extra,
+                stats=file_stats,
+            )
+            if ok2:
+                resp_text = resp_text2
+            else:
+                resp_text = ""
+
+        value_raw = parse_stage4_response(resp_text)
+        num_or_nd = _extract_first_number_or_nd(value_raw)
+        value = nd_normalize(num_or_nd)
+        if is_valid_debt_value(value):
+            return value
+        return "Н/Д"
+
+    def _stage4_worker(idx: int, payload: str) -> str:
+        value_51 = _call_stage4_model("gpt-5.1", payload)
+        if value_51 != "Н/Д":
+            return value_51
+
+        value_52 = _call_stage4_model("gpt-5.2", payload)
+        if value_52 != "Н/Д":
+            return value_52
+
+        return "Н/Д"
+
+    if stage4_payloads:
         futures_map_stage4: Dict[object, int] = {}
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        with ThreadPoolExecutor(max_workers=_calc_max_workers(len(fallback_idxs))) as ex:
-            for idx in fallback_idxs:
-                number = main_df.at[idx, "Номер"]
-                title = main_df.at[idx, "Заголовок блока"]
-                payload = fallback_payloads.get(idx, "")
-                futures_map_stage4[
-                    ex.submit(
-                        chat_client.chat,
-                        "mistral-small-latest",
-                        SYSTEM_PROMPT_STAGE4_FALLBACK,
-                        payload,
-                        "stage4_fallback",
-                        idx,
-                        number,
-                        title,
-                    )
-                ] = idx
+        max_workers_stage4 = min(10, _calc_max_workers(len(stage4_payloads)))
+        with ThreadPoolExecutor(max_workers=max_workers_stage4) as ex:
+            for idx, payload in stage4_payloads.items():
+                futures_map_stage4[ex.submit(_stage4_worker, idx, payload)] = idx
 
             for f in as_completed(futures_map_stage4):
                 idx = futures_map_stage4[f]
                 try:
-                    resp_text_llm = f.result()
-                except Exception as e:
-                    logger.error(
-                        "[stage4_fallback] Ошибка будущего результата для строки %d: %s",
-                        idx,
-                        e,
-                        exc_info=True,
-                        extra={
-                            "stage": "llm_stage4_fallback_error",
-                            "telegram_user_id": telegram_user_id,
-                            "telegram_username": telegram_username,
-                            "request_id": request_id,
-                            "duration_seconds": 0,
-                            "model": "mistral-small-latest",
-                            "api_key_id": "N/A",
-                            "file_name": original_pdf_name,
-                        },
-                    )
-                    resp_text_llm = ""
-                value_llm = nd_normalize(parse_stage4_response(resp_text_llm))
-                if is_valid_debt_value(value_llm):
-                    main_df.at[idx, "Сумма задолженности"] = value_llm
-                else:
-                    main_df.at[idx, "Сумма задолженности"] = "Н/Д"
-
-        fallback_duration = time.perf_counter() - fallback_start
-        logger.info(
-            "Этап 4: LLM-fallback для 'Сумма задолженности' завершён за %.3f с.",
-            fallback_duration,
-            extra={
-                "stage": "llm_stage4_fallback_done",
-                "telegram_user_id": telegram_user_id,
-                "telegram_username": telegram_username,
-                "request_id": request_id,
-                "duration_seconds": round(fallback_duration, 3),
-                "model": "mistral-small-latest",
-                "api_key_id": "FREE_API_KEY",
-                "file_name": original_pdf_name,
-            },
-        )
+                    value = f.result()
+                except Exception:
+                    value = "Н/Д"
+                main_df.at[idx, "Сумма задолженности"] = value
 
     stage4_duration = time.perf_counter() - stage4_start
     logger.info(
