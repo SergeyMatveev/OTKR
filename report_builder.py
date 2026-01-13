@@ -9,6 +9,8 @@ from decimal import Decimal, InvalidOperation
 import re
 
 import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
 
 
 _PKO_RAW = "ПРОФЕССИОНАЛЬНАЯКОЛЛЕКТОРСКАЯОРГАНИЗАЦИЯ"
@@ -212,11 +214,94 @@ def _format_sum_with_currency_for_excel(value: object) -> str:
     return f"{_group_thousands_spaces(integer)} RUB"
 
 
+def _format_sum_for_excel_number(value: object) -> object:
+    norm = _normalize_amount(value)
+    if norm == "Н/Д":
+        return None
+    try:
+        dec = Decimal(norm.replace(",", ".")).quantize(Decimal("0.01"))
+        return float(dec)
+    except Exception:
+        return None
+
+
 def _format_debt_for_excel(value: object) -> str:
     norm = _normalize_amount(value)
     if norm == "Н/Д":
         return "Н/Д"
     return norm.replace(",", ".")
+
+
+def _format_debt_for_excel_number(value: object) -> object:
+    norm = _normalize_amount(value)
+    if norm == "Н/Д":
+        return None
+    try:
+        dec = Decimal(norm.replace(",", ".")).quantize(Decimal("0.01"))
+        return float(dec)
+    except Exception:
+        return None
+
+
+def _postprocess_client_xlsx(xlsx_path: Path) -> None:
+    wb = load_workbook(xlsx_path)
+    ws = wb.active
+
+    widths = {
+        "Страница": 9,
+        "Название": 30,
+        "ИНН": 11,
+        "Дата сделки": 15,
+        "Сумма кредита": 15,
+        "Текущая задолженность": 25,
+        "УИд договора": 40,
+    }
+
+    sum_col_idx = None
+    debt_col_idx = None
+
+    for cell in ws[1]:
+        col_name = cell.value
+        if col_name in widths:
+            letter = get_column_letter(cell.col_idx)
+            ws.column_dimensions[letter].width = widths[col_name]
+        if col_name == "Сумма кредита":
+            sum_col_idx = cell.col_idx
+        if col_name == "Текущая задолженность":
+            debt_col_idx = cell.col_idx
+
+    def _coerce_to_number(c) -> None:
+        v = c.value
+        if v is None:
+            return
+        if isinstance(v, str):
+            s = v.strip()
+            if not s or s.upper() == "Н/Д":
+                return
+            s = s.replace(" ", "").replace(",", ".")
+            try:
+                dec = Decimal(s)
+            except Exception:
+                return
+            dec = dec.quantize(Decimal("0.01"))
+            c.value = float(dec)
+        elif isinstance(v, (int, float, Decimal)):
+            try:
+                dec = Decimal(str(v)).quantize(Decimal("0.01"))
+                c.value = float(dec)
+            except Exception:
+                pass
+        c.number_format = "0.00"
+
+    if sum_col_idx is not None:
+        for row_idx in range(2, ws.max_row + 1):
+            _coerce_to_number(ws.cell(row=row_idx, column=sum_col_idx))
+
+    if debt_col_idx is not None:
+        for row_idx in range(2, ws.max_row + 1):
+            _coerce_to_number(ws.cell(row=row_idx, column=debt_col_idx))
+
+    wb.save(xlsx_path)
 
 
 def build_credit_report_from_csv(
@@ -250,7 +335,7 @@ def build_credit_report_from_csv(
         "Название",
         "ИНН",
         "Дата сделки",
-        "Сумма и валюта",
+        "Сумма кредита",
         "Текущая задолженность",
         "УИд договора",
     ]
@@ -452,6 +537,7 @@ def build_credit_report_from_csv(
         )
         df_excel = pd.DataFrame([], columns=excel_columns)
         df_excel.to_excel(xlsx_path, index=False)
+        _postprocess_client_xlsx(xlsx_path)
         return [], xlsx_path
 
     # Группировка "добавленных" строк по финальному ИНН
@@ -509,9 +595,10 @@ def build_credit_report_from_csv(
     from string import ascii_uppercase
 
     blocks: List[str] = []
-    excel_rows: List[Dict[str, str]] = []
+    excel_rows: List[Dict[str, object]] = []
     block_index = 0
     total_debt = Decimal("0.00")
+    total_sum = Decimal("0.00")
 
     for inn_key in order_final_inn:
         group = groups[inn_key]
@@ -534,8 +621,8 @@ def build_credit_report_from_csv(
         for r in rows:
             page_val = r.get("page") or "Н/Д"
             date = r["date"] or "Н/Д"
-            sum_str = _format_sum_with_currency_for_excel(r["sum_text"])
-            debt_str = _format_debt_for_excel(r["debt_text"])
+            sum_val = _format_sum_for_excel_number(r["sum_text"])
+            debt_val = _format_debt_for_excel_number(r["debt_text"])
             uid_val = r["uid"] or "Н/Д"
 
             debt_norm_for_total = _normalize_amount(r["debt_text"])
@@ -545,14 +632,21 @@ def build_credit_report_from_csv(
                 except Exception:
                     pass
 
+            sum_norm_for_total = _normalize_amount(r["sum_text"])
+            if sum_norm_for_total != "Н/Д":
+                try:
+                    total_sum += Decimal(sum_norm_for_total.replace(",", "."))
+                except Exception:
+                    pass
+
             excel_rows.append(
                 {
                     "Страница": page_val,
                     "Название": final_name,
                     "ИНН": final_inn,
                     "Дата сделки": date,
-                    "Сумма и валюта": sum_str,
-                    "Текущая задолженность": debt_str,
+                    "Сумма кредита": sum_val,
+                    "Текущая задолженность": debt_val,
                     "УИд договора": uid_val,
                 }
             )
@@ -605,15 +699,15 @@ def build_credit_report_from_csv(
         blocks.append(block_text)
 
     total_debt_rounded = total_debt.quantize(Decimal("0.01"))
-    total_debt_excel = format(total_debt_rounded, "f")
+    total_sum_rounded = total_sum.quantize(Decimal("0.01"))
     excel_rows.append(
         {
             "Страница": "",
             "Название": "",
             "ИНН": "",
             "Дата сделки": "",
-            "Сумма и валюта": "",
-            "Текущая задолженность": total_debt_excel,
+            "Сумма кредита": float(total_sum_rounded),
+            "Текущая задолженность": float(total_debt_rounded),
             "УИд договора": "",
         }
     )
@@ -656,8 +750,6 @@ def build_credit_report_from_csv(
 
     df_excel = pd.DataFrame(excel_rows, columns=excel_columns)
     df_excel.to_excel(xlsx_path, index=False)
+    _postprocess_client_xlsx(xlsx_path)
 
     return messages, xlsx_path
-
-
-
